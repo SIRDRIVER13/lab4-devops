@@ -21,6 +21,7 @@ spec:
       labels:
         app: task-api
     spec:
+      terminationGracePeriodSeconds: 30
       containers:
         - name: task-api
           image: task-api:latest   # podmieniane w pipeline na task-api:<sha commita>
@@ -35,6 +36,11 @@ spec:
           env:
             - name: DATABASE_URL
               value: "postgresql+psycopg://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):5432/$(DB_NAME)"
+          lifecycle:
+            preStop:
+              exec:
+                # pod czeka, az Service przestanie kierowac do niego ruch
+                command: ["sleep", "5"]
           readinessProbe:
             httpGet: {path: /health, port: 8000}
             initialDelaySeconds: 3

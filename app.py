@@ -31,7 +31,7 @@ def create_app(database_url=None):
     def index():
         return jsonify(
             app="Task API",
-            message="Witaj w aplikacji Task API!",
+            message="Witaj w Task API – wersja 1.1.0!",
             version=APP_VERSION,
             environment=APP_ENV,
             host=socket.gethostname(),

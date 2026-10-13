@@ -4,7 +4,7 @@ metadata:
   name: task-api-config
 data:
   APP_ENV: "kubernetes-test"
-  APP_VERSION: "1.0.0"
+  APP_VERSION: "1.1.0"
   DB_HOST: "postgres"
   DB_NAME: "tasks"
 ---
