@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: task-api
+  labels:
+    app: task-api
+spec:
+  replicas: 3
+  # Rolling update: nowe pody wchodzą pojedynczo, stare znikają dopiero
+  # gdy nowe przejdą readinessProbe -> wdrożenie bez przerwy w działaniu
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: task-api
+  template:
+    metadata:
+      labels:
+        app: task-api
+    spec:
+      containers:
+        - name: task-api
+          image: task-api:latest   # podmieniane w pipeline na task-api:<sha commita>
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: task-api-config
+            - secretRef:
+                name: task-api-secret
+          env:
+            - name: DATABASE_URL
+              value: "postgresql+psycopg://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):5432/$(DB_NAME)"
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 256Mi}

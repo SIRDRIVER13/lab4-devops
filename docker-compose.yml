@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: tasks-db
+    environment:
+      POSTGRES_DB: tasks
+      POSTGRES_USER: tasks
+      POSTGRES_PASSWORD: tasks
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tasks -d tasks"]
+      interval: 5s
+      retries: 10
+
+  app:
+    build: .
+    image: ${APP_IMAGE:-task-api:local}
+    container_name: task-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://tasks:tasks@db:5432/tasks
+      APP_ENV: docker-compose
+      APP_VERSION: ${APP_VERSION:-1.0.0}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db-data:

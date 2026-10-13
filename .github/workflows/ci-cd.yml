@@ -1,0 +1,181 @@
+name: CI/CD
+
+# Pipeline uruchamia się automatycznie po każdym pushu do main
+# (oraz dla pull requestów - wtedy bez etapu deploy) i ręcznie z zakładki Actions.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE: task-api:${{ github.sha }}
+
+jobs:
+  # ---------------------------------------------------------------- BUILD
+  build:
+    name: 1. Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sprawdzenie składni kodu
+        run: python3 -m py_compile app.py
+
+      - name: Budowa obrazu Docker
+        run: docker build -t "$IMAGE" .
+
+      - name: Zapis obrazu jako artefakt dla kolejnych etapów
+        run: docker save "$IMAGE" -o image.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar
+          retention-days: 1
+
+  # ----------------------------------------------------------------- TEST
+  test:
+    name: 2. Test (jednostkowe + integracyjne)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalacja zależności
+        run: pip install -r requirements-dev.txt
+
+      - name: Testy jednostkowe (SQLite)
+        run: pytest -v
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Wczytanie obrazu z etapu build
+        run: docker load -i image.tar
+
+      - name: Uruchomienie aplikacji z PostgreSQL (docker compose)
+        run: APP_IMAGE="$IMAGE" APP_VERSION="ci-${GITHUB_SHA::7}" docker compose up -d --no-build --wait
+
+      - name: Testy integracyjne (aplikacja + prawdziwa baza)
+        run: BASE_URL=http://localhost:8000 pytest -v -o addopts="" tests/integration
+
+      - name: Logi kontenerów (przy błędzie)
+        if: failure()
+        run: docker compose logs
+
+      - name: Zatrzymanie środowiska
+        if: always()
+        run: docker compose down -v
+
+  # --------------------------------------------------------------- DEPLOY
+  deploy:
+    name: 3. Deploy (Kubernetes - środowisko testowe)
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalacja zależności testowych
+        run: pip install -r requirements-dev.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Wczytanie obrazu z etapu build
+        run: docker load -i image.tar
+
+      - name: Utworzenie klastra Kubernetes (kind)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: lab4
+
+      - name: Załadowanie obrazu do klastra
+        run: kind load docker-image "$IMAGE" --name lab4
+
+      - name: Ustawienie wersji i obrazu w manifestach
+        run: |
+          VERSION="$(grep 'APP_VERSION' k8s/configmap.yaml | cut -d'"' -f2)+${GITHUB_SHA::7}"
+          sed -i "s|APP_VERSION: .*|APP_VERSION: \"$VERSION\"|" k8s/configmap.yaml
+          sed -i "s|image: task-api:latest|image: $IMAGE|" k8s/deployment.yaml
+          echo "Wdrażana wersja: $VERSION"
+
+      - name: Wdrożenie bazy danych
+        run: |
+          kubectl apply -f k8s/configmap.yaml -f k8s/postgres.yaml
+          kubectl rollout status deployment/postgres --timeout=180s
+
+      - name: Wdrożenie aplikacji
+        run: |
+          kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml
+          kubectl rollout status deployment/task-api --timeout=240s
+          kubectl get deployments,pods,services -o wide
+
+      - name: Weryfikacja wdrożenia (smoke test + testy integracyjne)
+        run: |
+          kubectl port-forward service/task-api 8080:80 > /dev/null 2>&1 &
+          sleep 5
+          curl -s http://localhost:8080/
+          curl -s http://localhost:8080/health
+          BASE_URL=http://localhost:8080 pytest -v -o addopts="" tests/integration
+
+      - name: Rolling update bez przerwy w działaniu
+        run: |
+          # pod "probe" odpytuje aplikację co 0,5 s przez cały czas aktualizacji
+          kubectl run probe --image=curlimages/curl:8.10.1 --restart=Never --command -- sh -c \
+            'ok=0; fail=0; i=0; while [ $i -lt 120 ]; do if curl -sf -m 2 http://task-api/health > /dev/null; then ok=$((ok+1)); else fail=$((fail+1)); fi; i=$((i+1)); sleep 0.5; done; echo "Udane zapytania: $ok, nieudane: $fail"'
+          kubectl wait --for=condition=Ready pod/probe --timeout=60s
+          kubectl set env deployment/task-api APP_VERSION="rolling-update-${GITHUB_SHA::7}"
+          kubectl rollout status deployment/task-api --timeout=240s
+          kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/probe --timeout=120s
+          kubectl logs probe
+          kubectl rollout history deployment/task-api
+
+      - name: Podsumowanie wdrożenia
+        if: always()
+        run: |
+          {
+            echo "## Wdrożenie na środowisko testowe (Kubernetes)"
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+            echo "- Obraz: \`$IMAGE\`"
+            echo '```'
+            kubectl get pods -o wide || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------- NOTIFY
+  notify:
+    name: 4. Powiadomienie o statusie
+    needs: [build, test, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      STATUS: "build=${{ needs.build.result }}, test=${{ needs.test.result }}, deploy=${{ needs.deploy.result }}"
+    steps:
+      - name: Status w podsumowaniu pipeline
+        run: |
+          echo "## Status pipeline: $STATUS" >> "$GITHUB_STEP_SUMMARY"
+          echo "$STATUS"
+
+      - name: Powiadomienie Slack (gdy ustawiono sekret SLACK_WEBHOOK_URL)
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\": \"CI/CD ${GITHUB_REPOSITORY} @ ${GITHUB_SHA::7}: $STATUS\"}" \
+            "$SLACK_WEBHOOK_URL"
